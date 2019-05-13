@@ -1,25 +1,19 @@
-# %%
+import csv
 import os
-import pickle
-import re
 from pathlib import Path
-from pprint import pprint
-
-import en_core_web_md
 import en_core_web_lg
-import langdetect
-import nltk
-import pandas
 import pandas as pd
-import preprocessor as tweet_prep  # pip install tweet-preprocessor
+import preprocessor as tweet_prep
 from bs4 import BeautifulSoup
 from nltk.corpus import stopwords
-import spacy
+import matplotlib.pyplot as plt
+import warnings
 
-DATA_PATH = Path("./data/")
-PREPROCESSED_DATA_PATH = DATA_PATH / "cleaned"
-RAW_DATA_PATH = DATA_PATH / "raw"
-CACHE_FOLDER = Path("./cache/")
+warnings.filterwarnings("ignore", category=UserWarning, module='bs4')  # Ignore redundant bs4 warnings
+
+DATA_PATH = Path("./data/")  # Data folder path
+PREPROCESSED_DATA_PATH = DATA_PATH / "preprocessed"  # Preprocessed topics files path
+RAW_DATA_PATH = DATA_PATH / "raw"  # Raw topics files path
 
 STOP_WORDS = stopwords.words("english")
 DETECT_NER_LABELS = ["PERSON", "NORP", "FAC", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "WORK_OF_ART"]
@@ -27,78 +21,105 @@ DETECT_NER_LABELS = ["PERSON", "NORP", "FAC", "ORG", "GPE", "LOC", "PRODUCT", "E
 tweet_prep.set_options(tweet_prep.OPT.URL, tweet_prep.OPT.MENTION, tweet_prep.OPT.HASHTAG, tweet_prep.OPT.RESERVED,
                        tweet_prep.OPT.EMOJI, tweet_prep.OPT.SMILEY, tweet_prep.OPT.NUMBER)
 
-print("Loading model...")
-nlp = en_core_web_lg.load()
+model = None
 
 
-def tokenize(text, vocabulary=None):
-    return [token.lower()
-            for token in nltk.word_tokenize(text)
-            if token not in STOP_WORDS
-            and (vocabulary is None or token in vocabulary)]
+def get_model():
+    """ Lazy initializer of model """
+    global model
+
+    if model is None:
+        print("Loading model...")
+        model = en_core_web_lg.load()
+
+    return model
 
 
-def extract_tags(text):
+def extract_references(text):
     parsed_tweet = tweet_prep.parse(text)
-    hashtags = {h.match for h in parsed_tweet.hashtags} if parsed_tweet.hashtags else {}
-    mentions = {m.match for m in parsed_tweet.mentions} if parsed_tweet.mentions else {}
-    urls = {u.match for u in parsed_tweet.urls} if parsed_tweet.urls else {}
+    hashtags = [h.match for h in parsed_tweet.hashtags] if parsed_tweet.hashtags else []
+    mentions = [m.match for m in parsed_tweet.mentions] if parsed_tweet.mentions else []
+    urls = [u.match for u in parsed_tweet.urls] if parsed_tweet.urls else []
     return hashtags, mentions, urls
+
+
+def extract_entities(text):
+    nlp = get_model()
+    return [ent.text for ent in nlp(text).ents if ent.label_ in DETECT_NER_LABELS]
 
 
 def preprocess_tweet(text):
     return tweet_prep.clean(BeautifulSoup(text, 'lxml').text)
 
 
-def extract_entities(text):
-    return {ent.text for ent in nlp(text).ents if ent.label_ in DETECT_NER_LABELS}
-
-
 def get_topic_contents(topic_file_name):
-    with open(RAW_DATA_PATH / topic_file_name, "r", encoding="utf-8") as topic_file:
-        data = pandas.read_csv(topic_file, sep="\t", header=None,
-                               index_col="tweet_id", names=["tweet_id", "user_name", "user_id", "tweet"])
+    data = pd.read_csv(RAW_DATA_PATH / topic_file_name, sep="\t", quoting=csv.QUOTE_NONE, header=None,
+                       index_col="tweet_id", names=["tweet_id", "user_name", "user_id", "tweet"])
 
     data = data.drop(columns=["user_name", "user_id"])  # Remove useless columns
     data = data[data["tweet"] != "Not Available"]  # Remove not available tweets
     # data = data[data["tweet"].apply(lambda t: langdetect.detect(t) == "en")]  # TODO: Leave only english tweets?
 
-    data["hashtags"], data["mentions"], data["urls"] = zip(*data["tweet"].map(extract_tags))
-    data["processed"] = data["tweet"].apply(preprocess_tweet)
-    data["entities"] = data["processed"].apply(extract_entities)
-
-    # data = data.drop_duplicates("processed")  #TODO: remove duplicated tweets?
+    data["hashtags"], data["mentions"], data["urls"] = zip(*data["tweet"].map(extract_references))  # Extract references
+    data["processed"] = data["tweet"].apply(preprocess_tweet)  # Clean tweets
+    data["entities"] = data["processed"].apply(extract_entities)  # Extract named entities
     return data
 
 
-def get_topics():
-    with open(DATA_PATH / "TT-annotations.csv", "r", encoding="utf-8") as topic_file:
-        data = pandas.read_csv(topic_file, sep=";", header=None, names=["hash", "date", "name", "type"])
-    return data
+def get_topics_list():
+    return pd.read_csv(DATA_PATH / "TT-annotations.csv", sep=";",
+                       header=None, names=["hash", "date", "name", "type"])
+
+
+def join_references(tweet):
+    return list(tweet.hashtags) + list(tweet.mentions) + list(tweet.urls) + list(tweet.entities)
 
 
 def preprocess_all_topics():
-    topics = get_topics()
-    downloaded = set(os.listdir(RAW_DATA_PATH))
-    topics = topics[topics["hash"].apply(lambda h: h in downloaded)]
+    os.makedirs(PREPROCESSED_DATA_PATH, exist_ok=True)
+
+    topics = get_topics_list()
     for index, topic in topics.iterrows():
         print(f"{index}/{topics.shape[0]}: Preprocessing {topic['name']} ({topic['hash']})")
+        if os.path.isfile(PREPROCESSED_DATA_PATH / topic['hash']):
+            continue
 
         topic_data = get_topic_contents(topic['hash'])
         if topic_data is not None:
             topic_data["topic"] = topic['name']
+            topic_data["references"] = topic_data.apply(join_references, axis=1)
             topic_data.to_pickle(PREPROCESSED_DATA_PATH / topic['hash'])
 
 
-def get_preprocessed_topics():
-    topics = get_topics()
-    path = DATA_PATH / "cleaned"
-    preprocessed = set(os.listdir(path))
-    topics = topics[topics["hash"].apply(lambda h: h in preprocessed)]
-    topics_data = [pd.read_pickle(path / topic['hash'])
+def get_preprocessed_topics(n_topics=None, joined_references=True):
+    topics = get_topics_list()
+
+    if n_topics is not None:
+        topics = topics[:n_topics]
+
+    topics_data = [pd.read_pickle(PREPROCESSED_DATA_PATH / topic['hash'])
                    for index, topic in topics.iterrows()]
-    return pd.concat(topics_data)
+    data = pd.concat(topics_data, sort=False)
+    if joined_references:
+        data = data.drop(columns=["entities", "hashtags", "mentions", "urls"])
+    else:
+        data = data.drop(columns=["references"])
+    return data
+
+
+def topic_len_stat():
+    lens = []
+    topics = get_topics_list()
+    for index, topic in topics.iterrows():
+        topics_data = pd.read_pickle(PREPROCESSED_DATA_PATH / topic['hash'])
+        lens.append(topics_data.shape[0])
+
+    print(f"min: {min(lens)}, max:{max(lens)}")
+    plt.hist(lens, bins=30)
+    plt.title("Number of tweets in topic histogram")
+    plt.show()
 
 
 if __name__ == '__main__':
     preprocess_all_topics()
+    # topic_len_stat()
